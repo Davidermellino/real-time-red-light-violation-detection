@@ -1,76 +1,69 @@
-import warnings
-warnings.filterwarnings('ignore')
 
 import cv2
-import numpy as np
+import easyocr
 
+from threads.OCR_thread import OCR_thread
+from threads.frame_producer import FrameProducer
+from threads.processor_thread import FrameProcessor
 
-def detect_trafficlight_color(video_frame: np.ndarray) -> str:
-
-    #HARD-CODED POSITION, CHANGE THEM IF NEEDED
-    rect = (1810, 160, 110, 250)
-    x, y, w, h = rect
-
-    #crop the traffic light box
-    traffic_light = video_frame[y - int(h / 2): y + int(h / 2), x - int(w / 2):x + int(w / 2)].copy()
-    h, w, _ = traffic_light.shape
-
-    #Crop the 3 traffic light section
-    red = traffic_light[:int(h / 3), :]
-    yellow = traffic_light[int(h / 3):h - int(h / 3), :]
-    green = traffic_light[h - int(h / 3):, :]
-
-    colors = {
-        "yellow": yellow,
-        "green": green,
-        "red": red,
-    }
-
-    tl_color = ""
-    for name, arr in colors.items():
-
-        #apply tresholding to detect the active color (the red one do not pass the thresholding)
-        gris = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-        pimg = cv2.medianBlur(gris, 7)
-        _, thresholded_image = cv2.threshold(pimg, 110, 255, cv2.THRESH_BINARY)
-
-        #count the white pixel (if there are some, it means that that color is active)
-        white_pixels = np.sum(thresholded_image == 255, )
-
-        if white_pixels > 500:
-            tl_color = name
-
-        #the red one is the only one that do not pass the thresholding, (no white pixels when active)
-        #is active whene either green and yellow are not active
-        if name == "red" and tl_color == "":
-            tl_color = name
-
-    return tl_color
+from threads.pipeline import Pipeline
+import pandas as pd
 
 
 if __name__ == "__main__":
-    video_path = "traffic_video_modified.mp4"
 
-    cap = cv2.VideoCapture(video_path)
+    #create the buffers
+    frame_pipeline = Pipeline()
+    processed_pipeline = Pipeline()
+    violating_boxes_pipeline = Pipeline()
+    violating_plates_text_pipeline = Pipeline()
 
+    #create the threads
+    t1 = FrameProducer(frame_pipeline, "traffic_video_modified.mp4")
+    t2 = FrameProcessor(frame_pipeline, processed_pipeline,violating_boxes_pipeline, batch_dim=8)
 
-    if cap.isOpened():
-        while True:
-
-            ret, frame = cap.read()
-
-            if not ret:
-                print("Can't receive frame (stream end?). Exiting ...")
-                break
-
-            traffic_light_color = detect_trafficlight_color(frame)
-            cv2.rectangle(frame, (1500 -10, 100+10), (1500 + 210, 100 -50), (255,255,255), -1)
-            cv2.putText(frame, f'{traffic_light_color.upper()}',(1550,90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2 )
-            cv2.imshow("video", frame)
+    reader = easyocr.Reader(['en'])
+    t3 = OCR_thread(violating_boxes_pipeline, violating_plates_text_pipeline, reader)
 
 
-            if cv2.waitKey(1) == ord('q'):
-                break
+    t1.start()
+    t2.start()
+    t3.start()
 
-    cap.release()
+
+    plates_text = []
+    violation_info = []
+    while True:
+        ret, frame = processed_pipeline.get_message()
+
+        if not ret:  # Video finito
+            break
+
+        violating_plate_text_box_info = violating_plates_text_pipeline.get_message(block=False)
+
+        if violating_plate_text_box_info is not None:
+            violating_plate_text, box_info = violating_plate_text_box_info
+            #add text to list
+            plates_text.append(violating_plate_text)
+            violation_info.append(box_info)
+        if len(plates_text) > 1:
+            for i, text in enumerate(plates_text):
+                cv2.rectangle(frame, (int(700 * t2.scale_factor), int(40 * t2.scale_factor + i*70 )),(int(1400 * t2.scale_factor), int(120 * t2.scale_factor + i*70 )), (0, 0, 0), -1)
+                cv2.putText(frame, f"violation detected -> {text}", (int(720*t2.scale_factor),int(100*t2.scale_factor+(i*70))), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=1, color=(0,0,255), thickness=2)
+
+        cv2.imshow("c", frame)
+
+        if cv2.waitKey(30) & 0xFF == ord('q'):
+            t1.stop()
+            t2.stop()
+            break
+
     cv2.destroyAllWindows()
+
+
+    #write the results on csv
+    df = pd.DataFrame(violation_info)
+    df["plate"] = plates_text
+    df.to_csv("violations_data.csv", index=False)
+
+
